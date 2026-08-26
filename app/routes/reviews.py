@@ -1,0 +1,147 @@
+"""The /v1/reviews routes: submit, poll, stream."""
+
+from __future__ import annotations
+
+import json
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.config import (
+    DEFAULT_MAX_FINDINGS,
+    DEFAULT_PROVIDER,
+    MAX_MAX_FINDINGS,
+    PROVIDERS,
+)
+from app.diff.chunker import chunk_files
+from app.diff.parser import DiffParseError, parse_diff
+from app.errors import IDEMPOTENCY_CONFLICT, INVALID_DIFF, INVALID_JSON, NOT_FOUND, ApiError
+from app.events.sse import SSE_HEADERS, parse_last_event_id, stream_job
+from app.jobs.cache import body_hash, content_key
+from app.jobs.queue import JobPayload
+from app.models import Job
+
+router = APIRouter(prefix="/v1/reviews")
+
+
+def _options(payload: dict) -> tuple[str, int]:
+    """Read options leniently.
+
+    The published error vocabulary has no code for "bad option value", so an
+    unknown provider or a non-integer maxFindings falls back to its default
+    rather than inventing an error code. Unknown fields are simply never read.
+    """
+    raw = payload.get("options")
+    options = raw if isinstance(raw, dict) else {}
+
+    provider = options.get("provider")
+    if not isinstance(provider, str) or provider not in PROVIDERS:
+        provider = DEFAULT_PROVIDER
+
+    max_findings = options.get("maxFindings", DEFAULT_MAX_FINDINGS)
+    if isinstance(max_findings, bool) or not isinstance(max_findings, int):
+        max_findings = DEFAULT_MAX_FINDINGS
+    max_findings = max(0, min(max_findings, MAX_MAX_FINDINGS))
+
+    return provider, max_findings
+
+
+@router.post("")
+@router.post("/")
+async def submit_review(request: Request) -> JSONResponse:
+    state = request.app.state.service
+    raw = await request.body()
+
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ApiError(INVALID_JSON, f"request body is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ApiError(INVALID_DIFF, "body must be a JSON object containing 'diff'")
+
+    diff = payload.get("diff")
+    if not isinstance(diff, str) or not diff.strip():
+        raise ApiError(INVALID_DIFF, "'diff' is required and must be a non-empty string")
+
+    provider, max_findings = _options(payload)
+
+    try:
+        files = parse_diff(diff)
+    except DiffParseError as exc:
+        raise ApiError(INVALID_DIFF, f"diff is not a parseable unified diff: {exc}") from exc
+
+    chunks = chunk_files(files)
+    key = content_key(diff, provider, max_findings)
+    input_bytes = len(diff.encode("utf-8"))
+
+    # --- idempotency: same key + identical body -> the same job ------------
+    idem_key = request.headers.get("idempotency-key")
+    digest = body_hash(raw)
+    if idem_key:
+        existing = state.idempotency.lookup(idem_key)
+        if existing is not None:
+            stored_digest, stored_job_id = existing
+            if stored_digest != digest:
+                raise ApiError(
+                    IDEMPOTENCY_CONFLICT,
+                    "Idempotency-Key was already used with a different request body",
+                )
+            return _accepted(stored_job_id)
+
+    # --- caching: identical content -> mirror the earlier result ----------
+    source: Job | None = None
+    cached_id = state.cache.get(key)
+    if cached_id:
+        source = state.store.get(cached_id)
+
+    job = state.store.create(
+        provider=provider,
+        max_findings=max_findings,
+        content_key=key,
+        input_bytes=input_bytes,
+        chunks=len(chunks),
+        cache_hit=source is not None,
+    )
+    job_payload = JobPayload(chunks=chunks)
+
+    if source is not None:
+        await state.runner.submit_mirror(job, source, job_payload)
+    else:
+        # Registered before the work starts, so concurrent identical
+        # submissions mirror rather than duplicating the scan. Dropped again if
+        # the job fails, so a failure is never served from cache.
+        state.cache.put(key, job.id)
+        await state.runner.submit(job, job_payload)
+
+    if idem_key:
+        state.idempotency.put(idem_key, digest, job.id)
+
+    return _accepted(job.id)
+
+
+@router.get("/{job_id}")
+async def get_review(job_id: str, request: Request) -> JSONResponse:
+    job = request.app.state.service.store.get(job_id)
+    if job is None:
+        raise ApiError(NOT_FOUND, f"no review job with id {job_id!r}")
+    return JSONResponse(status_code=200, content=job.to_dict())
+
+
+@router.get("/{job_id}/stream")
+async def stream_review(job_id: str, request: Request) -> StreamingResponse:
+    job = request.app.state.service.store.get(job_id)
+    if job is None:
+        raise ApiError(NOT_FOUND, f"no review job with id {job_id!r}")
+
+    last_event_id = parse_last_event_id(request.headers.get("last-event-id"))
+    return StreamingResponse(
+        stream_job(job, last_event_id),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+def _accepted(job_id: str) -> JSONResponse:
+    # The contract documents this exact shape for 202, including on an
+    # idempotent replay of a job that has already progressed.
+    return JSONResponse(status_code=202, content={"jobId": job_id, "status": "queued"})
