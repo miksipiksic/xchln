@@ -47,7 +47,7 @@ def _options(payload: dict) -> tuple[str, int]:
 
 
 @router.post("")
-@router.post("/")
+@router.post("/", include_in_schema=False)
 async def submit_review(request: Request) -> JSONResponse:
     state = request.app.state.service
     raw = await request.body()

@@ -229,3 +229,14 @@ async def test_root_signposts_the_real_routes(client):
 async def test_root_is_public_but_v1_is_still_protected(client):
     assert (await client.get("/")).status_code == 200
     assert_envelope(await client.get("/v1/reviews/x"), "unauthorized", 401)
+
+
+async def test_openapi_advertises_the_bearer_scheme(client):
+    """Enforcement is in middleware, so the schema has to say so explicitly -
+    otherwise /docs offers no way to authenticate."""
+    schema = (await client.get("/openapi.json")).json()
+    assert "bearerAuth" in schema["components"]["securitySchemes"]
+    for path, item in schema["paths"].items():
+        if path.startswith("/v1"):
+            for operation in item.values():
+                assert operation.get("security") == [{"bearerAuth": []}], path

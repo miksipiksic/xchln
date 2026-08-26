@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -55,10 +56,16 @@ def create_app() -> FastAPI:
         title="AI Diff Review Service",
         version=SERVICE_VERSION,
         lifespan=lifespan,
+        description=(
+            "Submit a unified diff, get structured review findings back.\n\n"
+            "`/health` and `/spec` are public. Every `/v1` route needs a bearer "
+            "token - click **Authorize** and paste it to try them here."
+        ),
     )
 
     application.include_router(public.router)
     application.include_router(reviews.router)
+    _document_auth(application)
 
     # add_middleware wraps the app, so the LAST registered runs FIRST. Auth is
     # therefore outermost: an unauthenticated oversized POST is a 401, and no
@@ -69,6 +76,45 @@ def create_app() -> FastAPI:
 
     _install_error_handlers(application)
     return application
+
+
+def _document_auth(application: FastAPI) -> None:
+    """Advertise the bearer scheme in the OpenAPI document.
+
+    Enforcement lives in AuthMiddleware, which sits outside the routing layer
+    and so is invisible to FastAPI's schema generation. Without this, /docs
+    renders no Authorize control and every /v1 call from the page is a 401 the
+    reader cannot do anything about. This changes documentation only - the
+    middleware remains the thing that actually checks the token.
+    """
+
+    def openapi() -> dict:
+        if application.openapi_schema:
+            return application.openapi_schema
+
+        schema = get_openapi(
+            title=application.title,
+            version=application.version,
+            description=application.description,
+            routes=application.routes,
+        )
+        schema.setdefault("components", {})["securitySchemes"] = {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "description": "The token issued with this deployment.",
+            }
+        }
+        for path, item in schema["paths"].items():
+            if path.startswith("/v1"):
+                for operation in item.values():
+                    if isinstance(operation, dict):
+                        operation["security"] = [{"bearerAuth": []}]
+
+        application.openapi_schema = schema
+        return schema
+
+    application.openapi = openapi  # type: ignore[method-assign]
 
 
 def _install_error_handlers(application: FastAPI) -> None:
