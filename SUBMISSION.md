@@ -177,22 +177,20 @@ or overridden. The live run against Groq showed the same thing from the other
 side — the model *reported* the injected line as a finding rather than obeying
 it.
 
-Three smaller rejections, same shape — the convenient option quietly weakening
-something the contract pins down:
+Two more worth naming:
 
-- **A pydantic request model** for the body. FastAPI answers `422` for anything
-  that fails validation, including a body that is not valid JSON at all; the
-  contract splits exactly those two cases into `400 invalid_json` and
-  `422 invalid_diff`. Fifteen lines of hand-rolled parsing keeps the taxonomy
-  exact.
-- **Reusing the original jobId on a cache hit.** That job reported
-  `cacheHit: false` when it ran; handing its id back to a caller who is told
-  `cacheHit: true` makes one of the two responses wrong about the same job.
-- **Streaming findings per chunk** as each chunk finished, for lower perceived
-  latency. Chunks are file-aligned, but ordering is by path and a diff's files
-  need not arrive in lexicographic order, so such a stream can violate its own
-  ordering guarantee. `tests/diffs.py::TWO_FILES_UNSORTED` exists to fail that
-  design.
+- **A regular expression for the diff parser.** Deleted lines are marked with a
+  `-`, so a line of code that itself begins with `--` appears in the diff as
+  `--- something` — indistinguishable, to a pattern match, from the `---` header
+  that starts a new file. A regex parser splits one file into two there and
+  misattributes every finding after that point. The parser counts the lines each
+  hunk header promises instead, so it always knows whether it is inside a file's
+  changes or between them. `tests/diffs.py::TRICKY_REMOVAL` is exactly that case.
+- **Redis for the job store and cache.** It is one process, and nothing in the
+  contract has to survive a restart. I kept the state in memory behind a narrow
+  interface that could be swapped for Redis later, and wrote down the limitation
+  in *What I skipped*, rather than half-building a persistence layer the
+  exercise never asks for.
 
 ## What I skipped, and why
 
