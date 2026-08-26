@@ -82,7 +82,7 @@ idempotent key whose job has already finished.
 
 ## How the cross-cutting behaviours were verified
 
-141 in-process tests (`pytest`) plus a 58-check live probe over a real socket
+141 in-process tests (`pytest`) plus a 59-check live probe over a real socket
 (`python scripts/probe.py <base_url> <token>`). Both share the same diff
 fixtures in `tests/diffs.py`, so they cannot drift. The probe is what caught the
 things in-process tests structurally cannot: proxy buffering, platform body
