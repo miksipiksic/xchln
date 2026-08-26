@@ -48,7 +48,7 @@ def llm_settings() -> dict[str, object]:
     return {
         "api_key": _env("GROQ_API_KEY") or _env("LLM_API_KEY"),
         "base_url": _env("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
-        "model": _env("LLM_MODEL", "llama-3.3-70b-versatile"),
+        "model": _env("LLM_MODEL", "openai/gpt-oss-120b"),
         "timeout": float(_env("LLM_TIMEOUT_SECONDS", "20") or 20),
         "max_chunks": int(_env("LLM_MAX_CHUNKS", "8") or 8),
     }

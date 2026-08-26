@@ -40,7 +40,7 @@ docker run -p 8000:8000 -e API_BEARER_TOKEN=your-token ai-diff-review
 | `PORT` | no | `8000` | Listen port (free-tier hosts usually inject this). |
 | `GROQ_API_KEY` | for `llm` | — | Groq API key. Without it, `llm` jobs fail cleanly; `mock` is unaffected. |
 | `LLM_BASE_URL` | no | `https://api.groq.com/openai/v1` | Any OpenAI-compatible endpoint. |
-| `LLM_MODEL` | no | `llama-3.3-70b-versatile` | Model id. |
+| `LLM_MODEL` | no | `openai/gpt-oss-120b` | Model id. |
 | `LLM_TIMEOUT_SECONDS` | no | `20` | Per-request ceiling, kept under the 30 s job budget. |
 | `LLM_MAX_CHUNKS` | no | `8` | Cap on chunks sent to the model per job. |
 
