@@ -15,7 +15,17 @@ from app.config import (
 )
 from app.diff.chunker import chunk_files
 from app.diff.parser import DiffParseError, parse_diff
-from app.errors import IDEMPOTENCY_CONFLICT, INVALID_DIFF, INVALID_JSON, NOT_FOUND, ApiError
+from app.errors import (
+    IDEMPOTENCY_CONFLICT,
+    INVALID_DIFF,
+    INVALID_JSON,
+    NOT_FOUND,
+    PAYLOAD_TOO_LARGE,
+    RATE_LIMITED,
+    UNAUTHORIZED,
+    ApiError,
+    envelope,
+)
 from app.events.sse import SSE_HEADERS, parse_last_event_id, stream_job
 from app.jobs.cache import body_hash, content_key
 from app.jobs.queue import JobPayload
@@ -109,9 +119,50 @@ _IDEMPOTENCY_HEADER = {
 }
 
 
+def _error_doc(code: str, description: str, message: str) -> dict:
+    """Document a real error response.
+
+    FastAPI's stock 422 describes `{"detail": [...]}`, a shape this service
+    never emits - every non-2xx is the envelope. Declaring these explicitly
+    replaces the framework's guess with the truth.
+    """
+    return {
+        "description": description,
+        "content": {"application/json": {"example": envelope(code, message)}},
+    }
+
+
+_SUBMIT_RESPONSES: dict = {
+    202: {
+        "description": "Accepted. Processing is asynchronous - poll the job or open its stream.",
+        "content": {
+            "application/json": {
+                "example": {"jobId": "9da03113d8af4b1f8367a1be058276ec", "status": "queued"}
+            }
+        },
+    },
+    400: _error_doc(INVALID_JSON, "Body is not valid JSON", "request body is not valid JSON"),
+    401: _error_doc(UNAUTHORIZED, "Missing or wrong bearer token", "missing or invalid bearer token"),
+    409: _error_doc(
+        IDEMPOTENCY_CONFLICT,
+        "Idempotency-Key reused with a different body",
+        "Idempotency-Key was already used with a different request body",
+    ),
+    413: _error_doc(PAYLOAD_TOO_LARGE, "Body over 1 MiB", "request body exceeds 1048576 bytes"),
+    422: _error_doc(
+        INVALID_DIFF,
+        "diff missing, empty, or not a parseable unified diff",
+        "'diff' is required and must be a non-empty string",
+    ),
+    429: _error_doc(RATE_LIMITED, "Rate limit exceeded", "rate limit exceeded; retry shortly"),
+}
+
+
 @router.post(
     "",
+    status_code=202,
     summary="Submit a diff for review",
+    responses=_SUBMIT_RESPONSES,
     openapi_extra={"requestBody": _SUBMIT_BODY, "parameters": [_IDEMPOTENCY_HEADER]},
 )
 @router.post("/", include_in_schema=False)
@@ -186,7 +237,38 @@ async def submit_review(request: Request) -> JSONResponse:
     return _accepted(job.id)
 
 
-@router.get("/{job_id}")
+@router.get(
+    "/{job_id}",
+    summary="Poll a review job",
+    responses={
+        200: {
+            "description": "The job. `findings` is present once status is `done`.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "jobId": "9da03113d8af4b1f8367a1be058276ec",
+                        "status": "done",
+                        "findings": [
+                            {
+                                "id": "MOCK-001:pay.js:3",
+                                "ruleId": "MOCK-001",
+                                "path": "pay.js",
+                                "line": 3,
+                                "severity": "critical",
+                                "category": "security",
+                                "title": "eval usage",
+                                "evidence": "  eval(id);",
+                            }
+                        ],
+                        "usage": {"inputBytes": 167, "chunks": 1, "cacheHit": False},
+                    }
+                }
+            },
+        },
+        401: _error_doc(UNAUTHORIZED, "Missing or wrong bearer token", "missing or invalid bearer token"),
+        404: _error_doc(NOT_FOUND, "No such job", "no review job with id 'abc'"),
+    },
+)
 async def get_review(job_id: str, request: Request) -> JSONResponse:
     job = request.app.state.service.store.get(job_id)
     if job is None:
@@ -194,7 +276,34 @@ async def get_review(job_id: str, request: Request) -> JSONResponse:
     return JSONResponse(status_code=200, content=job.to_dict())
 
 
-@router.get("/{job_id}/stream")
+@router.get(
+    "/{job_id}/stream",
+    summary="Stream a review job (Server-Sent Events)",
+    description=(
+        "Emits `status` on every transition, one `finding` per finding in final "
+        "order, then `done` and closes. Connecting to a finished job replays the "
+        "whole sequence identically. `Last-Event-ID` resumes without repeating.\n\n"
+        "Swagger buffers the stream and shows it once complete; to watch events "
+        "arrive live use `curl -N`."
+    ),
+    responses={
+        200: {
+            "description": "An event stream.",
+            "content": {
+                "text/event-stream": {
+                    "example": (
+                        'id: 1\nevent: status\ndata: {"jobId":"9da0...","status":"queued"}\n\n'
+                        'id: 2\nevent: status\ndata: {"jobId":"9da0...","status":"running"}\n\n'
+                        'id: 3\nevent: finding\ndata: {"id":"MOCK-001:pay.js:3",...}\n\n'
+                        'id: 4\nevent: done\ndata: {"total":1,"usage":{...}}\n\n'
+                    )
+                }
+            },
+        },
+        401: _error_doc(UNAUTHORIZED, "Missing or wrong bearer token", "missing or invalid bearer token"),
+        404: _error_doc(NOT_FOUND, "No such job", "no review job with id 'abc'"),
+    },
+)
 async def stream_review(job_id: str, request: Request) -> StreamingResponse:
     job = request.app.state.service.store.get(job_id)
     if job is None:

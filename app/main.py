@@ -106,15 +106,38 @@ def _document_auth(application: FastAPI) -> None:
             }
         }
         for path, item in schema["paths"].items():
-            if path.startswith("/v1"):
-                for operation in item.values():
-                    if isinstance(operation, dict):
-                        operation["security"] = [{"bearerAuth": []}]
+            if not path.startswith("/v1"):
+                continue
+            for operation in item.values():
+                if not isinstance(operation, dict):
+                    continue
+                operation["security"] = [{"bearerAuth": []}]
+                _drop_stock_validation_error(operation)
 
         application.openapi_schema = schema
         return schema
 
     application.openapi = openapi  # type: ignore[method-assign]
+
+
+def _drop_stock_validation_error(operation: dict) -> None:
+    """Remove FastAPI's auto-generated 422 unless we documented it ourselves.
+
+    The framework advertises `{"detail": [...]}` for any route with a validated
+    parameter. This service never emits that shape - every non-2xx is the error
+    envelope - so leaving it in would document a response that cannot occur.
+    """
+    response = operation.get("responses", {}).get("422")
+    if not response:
+        return
+    schema_ref = (
+        response.get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+        .get("$ref", "")
+    )
+    if "HTTPValidationError" in schema_ref:
+        del operation["responses"]["422"]
 
 
 def _install_error_handlers(application: FastAPI) -> None:

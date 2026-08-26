@@ -256,3 +256,21 @@ async def test_submit_documents_a_request_body_with_a_working_example(client):
     body = await wait_for(client, response.json()["jobId"])
     assert body["status"] == "done"
     assert {f["ruleId"] for f in body["findings"]} >= {"MOCK-001", "MOCK-003", "MOCK-007"}
+
+
+async def test_documented_error_responses_match_what_the_service_sends(client):
+    """FastAPI's stock 422 describes a shape this service never emits. Every
+    documented error example must be a real envelope with a published code."""
+    schema = (await client.get("/openapi.json")).json()
+
+    for path, item in schema["paths"].items():
+        if not path.startswith("/v1"):
+            continue
+        for operation in item.values():
+            for status, response in operation.get("responses", {}).items():
+                if not status.startswith(("4", "5")):
+                    continue
+                example = response["content"]["application/json"]["example"]
+                assert set(example) == {"error"}, (path, status)
+                assert example["error"]["code"] in VALID_CODES, (path, status)
+                assert "detail" not in example, (path, status)
