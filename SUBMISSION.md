@@ -177,7 +177,7 @@ or overridden. The live run against Groq showed the same thing from the other
 side — the model *reported* the injected line as a finding rather than obeying
 it.
 
-Two more worth naming:
+Three more worth naming:
 
 - **A regular expression for the diff parser.** Deleted lines are marked with a
   `-`, so a line of code that itself begins with `--` appears in the diff as
@@ -191,6 +191,17 @@ Two more worth naming:
   interface that could be swapped for Redis later, and wrote down the limitation
   in *What I skipped*, rather than half-building a persistence layer the
   exercise never asks for.
+- **Fly.io for hosting.** The recommendation was a platform host: no idle
+  spin-down, a hostname that survives a restart. I chose a `cloudflared` tunnel
+  to my own machine instead — one of the options the brief lists. It needs no
+  third-party account or card for a four-day exercise, and what the graders hit
+  is byte-for-byte the artifact I tested, with no build step, no platform
+  runtime and no cold start in between. The cost is real and I will not pretend
+  otherwise: the service is up only while my machine is, and restarting the
+  tunnel issues a new hostname. That is the trade I made deliberately — fewer
+  moving parts I do not control, in exchange for depending on one I do. The
+  Dockerfile is in the repo, so moving to a platform host is a ten-minute change
+  if that balance ever stops making sense.
 
 ## What I skipped, and why
 
