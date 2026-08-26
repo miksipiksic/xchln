@@ -51,6 +51,9 @@ def llm_settings() -> dict[str, object]:
         "model": _env("LLM_MODEL", "openai/gpt-oss-120b"),
         "timeout": float(_env("LLM_TIMEOUT_SECONDS", "20") or 20),
         "max_chunks": int(_env("LLM_MAX_CHUNKS", "8") or 8),
+        # One 64 KiB chunk is far past a model context window; the llm
+        # provider batches added lines under this budget per request.
+        "max_request_chars": int(_env("LLM_MAX_REQUEST_CHARS", "12000") or 12000),
     }
 
 

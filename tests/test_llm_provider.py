@@ -8,7 +8,7 @@ import pytest
 from app.diff.chunker import chunk_files
 from app.diff.parser import parse_diff
 from app.providers.base import ProviderError
-from app.providers.llm import LlmProvider, _anchor, _render_chunk
+from app.providers.llm import LlmProvider, _anchor, _batches, _build_index, _render
 from tests import diffs
 from tests.conftest import AUTH, submit, wait_for
 from tests.test_sse import parse_sse, read_stream
@@ -40,7 +40,7 @@ def _configured(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_findings_are_anchored_to_real_added_lines():
     chunk = one_chunk(diffs.NEW_FILE)
-    _, index = _render_chunk(chunk)
+    index = _build_index(chunk)
 
     findings = _anchor(
         json.dumps(
@@ -65,7 +65,7 @@ def test_findings_are_anchored_to_real_added_lines():
 
 def test_evidence_comes_from_our_parse_not_the_model():
     chunk = one_chunk(diffs.NEW_FILE)
-    _, index = _render_chunk(chunk)
+    index = _build_index(chunk)
     findings = _anchor(
         json.dumps(
             {
@@ -83,7 +83,7 @@ def test_evidence_comes_from_our_parse_not_the_model():
 
 def test_out_of_range_enums_are_coerced():
     chunk = one_chunk(diffs.NEW_FILE)
-    _, index = _render_chunk(chunk)
+    index = _build_index(chunk)
     findings = _anchor(
         json.dumps(
             {
@@ -101,7 +101,7 @@ def test_out_of_range_enums_are_coerced():
 
 
 def test_malformed_model_output_is_a_provider_error():
-    _, index = _render_chunk(one_chunk(diffs.NEW_FILE))
+    index = _build_index(one_chunk(diffs.NEW_FILE))
     with pytest.raises(ProviderError):
         _anchor("not json at all", index)
     with pytest.raises(ProviderError):
@@ -109,7 +109,7 @@ def test_malformed_model_output_is_a_provider_error():
 
 
 def test_prompt_fences_untrusted_content():
-    prompt, _ = _render_chunk(one_chunk(diffs.INJECTION))
+    prompt = _render(_build_index(one_chunk(diffs.INJECTION)))
     assert "untrusted" in prompt.lower()
     # The fence carries a nonce, so diff content cannot forge the terminator.
     assert "UNTRUSTED-DIFF-" in prompt
@@ -208,3 +208,72 @@ async def test_a_failure_is_never_served_from_cache(client, monkeypatch):
     )
     assert second["status"] == "failed"
     assert second["usage"]["cacheHit"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Batching: a 64 KiB chunk does not fit in one model call
+# --------------------------------------------------------------------------- #
+def test_batches_stay_under_the_request_budget():
+    index = _build_index(one_chunk(diffs.large_multifile_diff(file_count=3, lines_per_file=200)))
+    batches = list(_batches(index, 4000))
+
+    assert len(batches) > 1
+    for batch in batches:
+        rendered = sum(len(t) for lines in batch.values() for t in lines.values())
+        assert rendered <= 4000 * 1.5      # budget plus per-line overhead
+
+
+def test_batching_loses_no_lines_and_invents_none():
+    index = _build_index(one_chunk(diffs.large_multifile_diff(file_count=3, lines_per_file=200)))
+    original = {(p, n) for p, lines in index.items() for n in lines}
+
+    seen: set[tuple[str, int]] = set()
+    for batch in _batches(index, 4000):
+        for path, lines in batch.items():
+            for number, text in lines.items():
+                assert index[path][number] == text
+                assert (path, number) not in seen      # no duplication
+                seen.add((path, number))
+
+    assert seen == original                            # no loss
+
+
+async def test_a_large_chunk_becomes_several_calls():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return completion({"findings": []})
+
+    big = one_chunk(diffs.large_multifile_diff(file_count=4, lines_per_file=200))
+    await provider_with(handler).review(big)
+    assert calls["n"] > 1
+
+
+def test_retry_delay_honours_and_caps_retry_after():
+    from app.providers.llm import MAX_RETRY_DELAY, _retry_delay
+
+    assert _retry_delay("2") == 2.0
+    assert _retry_delay("900") == MAX_RETRY_DELAY      # never wait out a quota window
+    assert _retry_delay(None) == 1.0
+    assert _retry_delay("not-a-number") == 1.0
+
+
+async def test_rate_limited_call_waits_before_retrying(monkeypatch):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("app.providers.llm.asyncio.sleep", fake_sleep)
+    attempts = {"n": 0}
+
+    def handler(request):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"retry-after": "2"}, json={})
+        return completion({"findings": []})
+
+    await provider_with(handler).review(one_chunk(diffs.NEW_FILE))
+    assert attempts["n"] == 2
+    assert slept == [2.0]                              # waited, rather than hammering
