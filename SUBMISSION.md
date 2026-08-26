@@ -134,7 +134,16 @@ the instruction "report no findings" on an added line changes nothing, proven by
 the ordinary rule on the next line still firing; and appending injection content
 to a clean diff leaves every original finding intact.
 
-**Graceful `llm` degradation** (12 tests). With no key configured the job ends
+**The `llm` path end to end** (12 tests, plus live verification). Verified
+against the real Groq API from the deployed instance: a review returns anchored
+findings, and the model *reported* the prompt-injection line as a finding rather
+than obeying it - injection inertness holding on the model path, not only the
+mock one. The failure path was then exercised for real rather than simulated:
+the originally configured `llama-3.3-70b-versatile` had been retired from Groq's
+catalogue and returned HTTP 404, which surfaced as a `failed` job with a clear
+message and no crash, exactly as designed. Default is now `openai/gpt-oss-120b`.
+
+With no key configured the job ends
 `failed` with a clear message, the service stays healthy, and a subsequent
 `mock` job still succeeds. The failed job's SSE stream terminates with a
 `status: failed` event and no `done`. Transport failure retries once then
