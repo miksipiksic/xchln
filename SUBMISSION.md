@@ -57,6 +57,17 @@ The order of those first three middlewares is a decision, not an accident: auth
 is outermost, so an unauthenticated 2 MiB POST is a `401` and no request body is
 read before the caller is known.
 
+Two additions sit outside the contract, both for whoever has to check the
+deployment by hand. `GET /` is a signpost: a bare `404` at the base URL reads as
+an outage even when the service is perfectly healthy. And because auth is
+enforced in middleware, FastAPI's schema generation cannot see it — so `/docs`
+rendered no **Authorize** control and no request-body editor, making every `/v1`
+call from that page an unfixable `400` or `401`. The OpenAPI document now
+declares the bearer scheme and the submit body explicitly. Both are
+documentation only; the middleware is still the thing that checks the token. A
+test submits the documented example against the service, so the example on the
+docs page cannot drift into being wrong.
+
 A submission is parsed and chunked **synchronously** (that is what makes a `422`
 possible at all), then handed to the pool; the response is `202` and everything
 after that is asynchronous. The parsed chunks are carried on the job, so the
@@ -192,7 +203,18 @@ dependency, and precise control of the timeout, which matters under a 30 s job
 budget). Failure is a first-class path: missing key, timeout, transport error,
 HTTP error, or unparseable output all raise `ProviderError`, which the runner
 turns into a `failed` job carrying `{"code", "message"}`. One retry on transient
-classes (429/5xx/network), then a clean give-up. Nothing propagates as a crash.
+classes (429/5xx/network), waiting out the endpoint's own `Retry-After` — capped
+at 5 s, because a provider may advertise a whole quota window and holding a
+worker that long would blow the job's latency budget. Then a clean give-up.
+Nothing propagates as a crash.
+
+Chunking is sized for the contract, not for a model: 64 KiB is comfortable for
+the mock rules and far past what fits in one completion request. The `llm`
+provider therefore batches added lines under a character budget *beneath* the
+chunk boundary. Splitting within a file is safe here in a way it would not be
+for the mock rules — the model judges lines independently, and each batch's
+output is anchored against that batch, so a line can never be attributed to a
+batch that did not contain it.
 
 Injection defence is **structural, not prompt-based**. The prompt does fence the
 diff in a nonce-delimited block and state that the content is data, but prompts
@@ -258,11 +280,19 @@ idempotent key whose job has already finished.
 
 ## How the cross-cutting behaviours were verified
 
-141 in-process tests (`pytest`) plus a 59-check live probe over a real socket
+150 in-process tests (`pytest`) plus a 59-check live probe over a real socket
 (`python scripts/probe.py <base_url> <token>`). Both share the same diff
 fixtures in `tests/diffs.py`, so they cannot drift. The probe is what caught the
 things in-process tests structurally cannot: proxy buffering, platform body
 caps, cold-start latency.
+
+That division earned itself. The unit suite was green throughout while two real
+defects sat in the `llm` path, and only driving a 128 KiB diff through the
+deployed service surfaced them: the endpoint answered `413` because a 64 KiB
+chunk does not fit a context window, and the retry then fired instantly into the
+same rate limit. Both are fixed and now covered by tests — but no amount of
+mocked transport would have found either, because both were assumptions about
+someone else's service rather than about my own code.
 
 **Chunking** (10 tests). The design goal was equivalence *by construction* — a
 file never spans chunks and every rule is file-scoped — and the property test
@@ -310,14 +340,20 @@ the instruction "report no findings" on an added line changes nothing, proven by
 the ordinary rule on the next line still firing; and appending injection content
 to a clean diff leaves every original finding intact.
 
-**The `llm` path end to end** (12 tests, plus live verification). Verified
+**The `llm` path end to end** (17 tests, plus live verification). Verified
 against the real Groq API from the deployed instance: a review returns anchored
 findings, and the model *reported* the prompt-injection line as a finding rather
 than obeying it - injection inertness holding on the model path, not only the
-mock one. The failure path was then exercised for real rather than simulated:
-the originally configured `llama-3.3-70b-versatile` had been retired from Groq's
-catalogue and returned HTTP 404, which surfaced as a `failed` job with a clear
-message and no crash, exactly as designed. Default is now `openai/gpt-oss-120b`.
+mock one. Batching is covered by property tests: batches stay under the request
+budget, and every added line appears in exactly one batch with its text intact -
+none lost, none duplicated, none invented.
+
+The failure paths were exercised for real rather than simulated, three times
+over. The originally configured `llama-3.3-70b-versatile` had been retired from
+Groq's catalogue and returned `404`. A 128 KiB diff returned `413`. The retry
+after a `429` returned `429` again. Each surfaced as a `failed` job with a clear
+message and no crash, which is the required behaviour - and each then got fixed,
+so the path now completes instead of merely failing well.
 
 With no key configured the job ends
 `failed` with a clear message, the service stays healthy, and a subsequent

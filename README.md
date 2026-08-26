@@ -118,6 +118,8 @@ curl -sSN localhost:8000/v1/reviews/$JOB/stream -H "Authorization: Bearer $TOKEN
 
 | Route | Auth | Returns |
 |---|---|---|
+| `GET /` | public | a signpost to the routes below (not part of the contract) |
+| `GET /docs` | public | interactive API explorer - click **Authorize**, paste the token, submit a diff from the browser |
 | `GET /health` | public | `{status, version, uptimeSeconds}` |
 | `GET /spec` | public | declared providers and limits |
 | `POST /v1/reviews` | bearer | `202 {jobId, status: "queued"}` |
@@ -184,6 +186,7 @@ stream. A sustained 30/min always succeeds; a burst beyond that gets `429` with
 | `LLM_MODEL` | no | `openai/gpt-oss-120b` | Model id. |
 | `LLM_TIMEOUT_SECONDS` | no | `20` | Per-request ceiling, kept under the 30 s job budget. |
 | `LLM_MAX_CHUNKS` | no | `8` | Cap on chunks sent to the model per job. |
+| `LLM_MAX_REQUEST_CHARS` | no | `12000` | Added lines are batched under this per model call. A 64 KiB chunk is sized for the contract, not for a context window. |
 
 Copy `.env.example` to `.env` and fill it in. **`.env` is gitignored; never put a
 real key in `.env.example`.**
@@ -195,7 +198,7 @@ pool *and* the spec route, so the declaration cannot drift from actual behaviour
 ## Tests
 
 ```bash
-pytest                                                  # 141 in-process tests
+pytest                                                  # 150 in-process tests
 python scripts/probe.py http://localhost:8000 "$API_BEARER_TOKEN"
 ```
 
@@ -223,7 +226,7 @@ app/
   providers/      base.py (interface) · mock.py (rules) · llm.py (Groq)
   jobs/           store.py · cache.py (content + idempotency) · queue.py (pool)
   events/         bus.py (append-only log) · sse.py (wire format)
-tests/            141 tests: unit, contract, property
+tests/            150 tests: unit, contract, property
 scripts/
   probe.py        contract probe against a live URL
   serve.ps1       start service + Cloudflare tunnel, detached
