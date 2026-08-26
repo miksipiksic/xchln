@@ -213,3 +213,19 @@ async def test_injection_does_not_disturb_other_findings(client):
     clean_ids = {f["id"] for f in clean["findings"]}
     spiked_ids = {f["id"] for f in spiked["findings"]}
     assert clean_ids <= spiked_ids
+
+
+async def test_root_signposts_the_real_routes(client):
+    """Not part of the contract - it exists so a hand-check of the deployment
+    does not look like an outage."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["routes"]["health"] == "GET /health"
+    assert "/v1/reviews" in body["routes"]["submit"]
+
+
+async def test_root_is_public_but_v1_is_still_protected(client):
+    assert (await client.get("/")).status_code == 200
+    assert_envelope(await client.get("/v1/reviews/x"), "unauthorized", 401)
