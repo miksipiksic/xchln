@@ -46,7 +46,74 @@ def _options(payload: dict) -> tuple[str, int]:
     return provider, max_findings
 
 
-@router.post("")
+_EXAMPLE_DIFF = (
+    "--- a/pay.js\n"
+    "+++ b/pay.js\n"
+    "@@ -1,1 +1,4 @@\n"
+    " function pay(id) {\n"
+    '+  const sql = "SELECT * FROM orders WHERE id = " + id;\n'
+    "+  eval(id);\n"
+    '+  console.log(sql); // TODO remove\n'
+)
+
+# The body is read and validated by hand (see the docstring below), so FastAPI
+# cannot infer a schema for it and /docs would otherwise render no editor at
+# all - and send an empty body. This describes the shape for documentation
+# only; nothing here validates the request.
+_SUBMIT_BODY = {
+    "required": True,
+    "content": {
+        "application/json": {
+            "schema": {
+                "type": "object",
+                "required": ["diff"],
+                "properties": {
+                    "diff": {
+                        "type": "string",
+                        "description": "A unified diff. Added lines are what get reviewed.",
+                    },
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "provider": {
+                                "type": "string",
+                                "enum": list(PROVIDERS),
+                                "default": DEFAULT_PROVIDER,
+                            },
+                            "maxFindings": {
+                                "type": "integer",
+                                "default": DEFAULT_MAX_FINDINGS,
+                                "minimum": 0,
+                            },
+                        },
+                    },
+                },
+            },
+            "example": {
+                "diff": _EXAMPLE_DIFF,
+                "options": {"provider": "mock", "maxFindings": 100},
+            },
+        }
+    },
+}
+
+_IDEMPOTENCY_HEADER = {
+    "name": "Idempotency-Key",
+    "in": "header",
+    "required": False,
+    "schema": {"type": "string"},
+    "description": (
+        "Optional. The same key with a byte-identical body returns the same "
+        "jobId; the same key with a different body is a 409."
+    ),
+}
+
+
+@router.post(
+    "",
+    summary="Submit a diff for review",
+    openapi_extra={"requestBody": _SUBMIT_BODY, "parameters": [_IDEMPOTENCY_HEADER]},
+)
 @router.post("/", include_in_schema=False)
 async def submit_review(request: Request) -> JSONResponse:
     state = request.app.state.service

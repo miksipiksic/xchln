@@ -240,3 +240,19 @@ async def test_openapi_advertises_the_bearer_scheme(client):
         if path.startswith("/v1"):
             for operation in item.values():
                 assert operation.get("security") == [{"bearerAuth": []}], path
+
+
+async def test_submit_documents_a_request_body_with_a_working_example(client):
+    """The handler parses the body by hand, so the schema must describe it or
+    /docs renders no editor and sends an empty body."""
+    schema = (await client.get("/openapi.json")).json()
+    operation = schema["paths"]["/v1/reviews"]["post"]
+    content = operation["requestBody"]["content"]["application/json"]
+    assert content["schema"]["required"] == ["diff"]
+
+    # The example shipped in the docs must actually be accepted by the service.
+    response = await client.post("/v1/reviews", json=content["example"], headers=AUTH)
+    assert response.status_code == 202, response.text
+    body = await wait_for(client, response.json()["jobId"])
+    assert body["status"] == "done"
+    assert {f["ruleId"] for f in body["findings"]} >= {"MOCK-001", "MOCK-003", "MOCK-007"}
