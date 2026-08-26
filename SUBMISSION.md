@@ -4,7 +4,7 @@
 
 A single FastAPI process, all state in memory, five layers:
 
-```
+```text
 HTTP           raw ASGI middleware (auth -> rate limit -> body limit) -> routes
 Orchestration  job store · content cache · idempotency index · 4-worker pool
 Pipeline       parse -> chunk -> provider -> normalize (dedup, order, truncate)
@@ -154,26 +154,45 @@ rejected or overridden.
 ## AI tools used
 
 Built with **Claude Code (Opus 5)** — planning, implementation, tests, docs. My
-role was the contract reading, the ambiguity calls in the table above, and
-rejecting suggestions that traded a scored guarantee for something softer.
+role was reading the contract closely, making the ambiguity calls in the table
+above, and rejecting suggestions that traded a guarantee for something softer.
 
-**A suggestion I rejected.** The plan initially proposed emitting `finding`
-events per chunk as each chunk finished — genuinely better perceived latency on
-a large diff, and a fair reading of "one per finding, as discovered". I rejected
-it. Chunks are file-boundary aligned, but the required ordering is
-`path` lexicographic, and a diff's files need not appear in lexicographic order,
-so a per-chunk stream can emit `zeta/last.js` before `alpha/first.js` — a direct
-violation of "ordering everywhere (results and streams)". Findings are therefore
-buffered, passed once through `models.normalize()`, and only then streamed;
-`tests/diffs.py::TWO_FILES_UNSORTED` exists specifically to fail the rejected
-design. Correctness on an explicit, scored guarantee beats perceived latency on
-an unmeasured one.
+**A suggestion I rejected.** The first answer to prompt injection on the `llm`
+path was a firmer system prompt: tell the model the diff is untrusted data and
+that it must never follow instructions inside it. I kept that prompt. I refused
+to let it *be* the defence. A prompt is a request, not a boundary — it fails
+exactly when someone is trying hardest to break it.
 
-Two smaller rejections, same shape: adding a `findingsTotal` key to `usage` to
-"show" that truncation had not distorted the scan (rejected — the contract
-documents exactly three keys and a strict comparison would fail), and reusing
-the original jobId on a cache hit (rejected — it would retroactively flip that
-job's own `cacheHit`).
+So the real control is structural. Every finding the model returns is
+re-anchored against our own parse of the diff: dropped unless its `path` is a
+file we actually sent and its `line` is a genuine added line in that file.
+Severity and category are coerced into the allowed enums, the id is assigned by
+us, and the evidence text comes from our parse, never from the model. A fully
+hijacked model can still say whatever it likes — it just cannot get a finding
+about a file it was never given past the anchor check.
+
+Tested directly in `tests/test_llm_provider.py`: findings for invented files,
+invented lines, out-of-range enums and model-supplied evidence are all rejected
+or overridden. The live run against Groq showed the same thing from the other
+side — the model *reported* the injected line as a finding rather than obeying
+it.
+
+Three smaller rejections, same shape — the convenient option quietly weakening
+something the contract pins down:
+
+- **A pydantic request model** for the body. FastAPI answers `422` for anything
+  that fails validation, including a body that is not valid JSON at all; the
+  contract splits exactly those two cases into `400 invalid_json` and
+  `422 invalid_diff`. Fifteen lines of hand-rolled parsing keeps the taxonomy
+  exact.
+- **Reusing the original jobId on a cache hit.** That job reported
+  `cacheHit: false` when it ran; handing its id back to a caller who is told
+  `cacheHit: true` makes one of the two responses wrong about the same job.
+- **Streaming findings per chunk** as each chunk finished, for lower perceived
+  latency. Chunks are file-aligned, but ordering is by path and a diff's files
+  need not arrive in lexicographic order, so such a stream can violate its own
+  ordering guarantee. `tests/diffs.py::TWO_FILES_UNSORTED` exists to fail that
+  design.
 
 ## What I skipped, and why
 
