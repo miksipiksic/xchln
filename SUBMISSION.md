@@ -2,15 +2,60 @@
 
 ## Architecture
 
-A single FastAPI process, all state in memory, five layers:
+A single FastAPI process, all state in memory, five layers. Every request
+crosses them in the same order:
 
-```text
-HTTP           raw ASGI middleware (auth -> rate limit -> body limit) -> routes
-Orchestration  job store · content cache · idempotency index · 4-worker pool
-Pipeline       parse -> chunk -> provider -> normalize (dedup, order, truncate)
-Providers      mock | llm, behind one interface
-Events         per-job append-only log + subscriber fan-out -> SSE and replay
+```mermaid
+flowchart TB
+    Client(["Client"])
+
+    subgraph HTTP["HTTP layer — app/deps, app/routes"]
+        direction TB
+        Auth["Auth<br/>bearer token, every /v1 route, every method"]
+        Rate["Rate limit<br/>POST /v1/reviews only, token bucket"]
+        Body["Body limit<br/>1 MiB, refused before the body is read"]
+        Route["Routes<br/>submit · poll · stream"]
+        Auth --> Rate --> Body --> Route
+    end
+
+    subgraph ORCH["Orchestration — app/jobs"]
+        direction TB
+        Gate["Idempotency index · content cache"]
+        Store["Job store"]
+        Pool["Worker pool<br/>4 concurrent, a 5th queues"]
+        Gate --> Store --> Pool
+    end
+
+    subgraph PIPE["Pipeline — app/diff, app/models"]
+        direction TB
+        Parse["parse_diff<br/>reconstructed new-file view"]
+        Chunk["chunk_files<br/>64 KiB, split only between files"]
+        Norm["normalize<br/>dedup by id · order by path, line, ruleId · truncate"]
+        Parse --> Chunk
+    end
+
+    subgraph PROV["Providers — app/providers"]
+        direction TB
+        Mock["mock<br/>nine deterministic rules"]
+        Llm["llm<br/>Groq, output re-anchored to the parsed diff"]
+    end
+
+    Log["Event log — append-only, one per job<br/>app/events"]
+
+    Client --> Auth
+    Route --> Gate
+    Route --> Parse
+    Pool --> Mock
+    Pool --> Llm
+    Mock --> Norm
+    Llm --> Norm
+    Norm --> Log
+    Log -.->|"GET · SSE · replay"| Client
 ```
+
+The order of those first three middlewares is a decision, not an accident: auth
+is outermost, so an unauthenticated 2 MiB POST is a `401` and no request body is
+read before the caller is known.
 
 A submission is parsed and chunked **synchronously** (that is what makes a `422`
 possible at all), then handed to the pool; the response is `202` and everything
@@ -26,6 +71,107 @@ Every declared limit lives once, in `app/config.py`. `GET /spec` serialises from
 those same constants that the body-limit middleware, the chunker, the rate
 limiter and the worker pool read. The self-declaration cannot drift from the
 behaviour because there is no second copy of any number.
+
+### The life of one review
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as POST /v1/reviews
+    participant S as Store · cache
+    participant W as Worker
+    participant P as Provider
+    participant L as Event log
+
+    C->>API: diff + options
+    API->>API: auth · size · JSON · is it a diff?
+    API->>S: create job, register content key
+    API-->>C: 202 {jobId, status: "queued"}
+    Note over C,API: the caller is free from here on
+
+    S->>W: dequeue (4 workers, a 5th waits)
+    W->>L: status: running
+    loop one pass per chunk
+        W->>P: review(chunk)
+        P-->>W: findings
+    end
+    W->>W: dedup · order · truncate
+    W->>L: finding × N, in final order
+    W->>L: done {total, usage}
+
+    alt polling
+        C->>S: GET /v1/reviews/{jobId}
+        S-->>C: status, findings, usage
+    else streaming
+        C->>L: GET /v1/reviews/{jobId}/stream
+        L-->>C: the recorded log, live or replayed
+    end
+```
+
+### Submit: what happens before any work is done
+
+The two lookups on the way in are different mechanisms that are easy to
+conflate. **Idempotency** is keyed by the client's header plus the raw body and
+answers "have I seen this exact *request*?". **Caching** is keyed by content
+alone and answers "have I already done this exact *work*?".
+
+```mermaid
+flowchart TD
+    Start(["POST /v1/reviews"]) --> Valid{"request valid?"}
+    Valid -->|"over 1 MiB"| E413["413 payload_too_large"]
+    Valid -->|"malformed JSON"| E400["400 invalid_json"]
+    Valid -->|"missing or unparseable diff"| E422["422 invalid_diff"]
+    Valid -->|"ok"| Idem{"Idempotency-Key seen?"}
+
+    Idem -->|"same key, same body"| Replay["202 — the original jobId"]
+    Idem -->|"same key, different body"| E409["409 idempotency_conflict"]
+    Idem -->|"new key, or none"| Cache{"content hash seen?"}
+
+    Cache -->|"yes"| Mirror["new job mirrors the original's findings<br/>cacheHit: true · no work redone"]
+    Cache -->|"no"| Fresh["new job, work enqueued<br/>cacheHit: false"]
+
+    Mirror --> Accept["202 {jobId, status: queued}"]
+    Fresh --> Accept
+```
+
+A cache hit deliberately mints a *new* jobId rather than handing back the
+original's. The original reported `cacheHit: false` when it ran; reusing its id
+for a caller who is told `true` would make one of the two responses wrong about
+the same job.
+
+### Why chunking cannot change the answer
+
+```mermaid
+flowchart LR
+    subgraph In["Diff — files in payload order"]
+        direction TB
+        F1["zeta/last.js"]
+        F2["alpha/first.js"]
+        F3["mid/other.js"]
+    end
+
+    subgraph Ch["Chunks — at most 64 KiB, split only between files"]
+        direction TB
+        C1["chunk 1"]
+        C2["chunk 2"]
+    end
+
+    F1 --> C1
+    F2 --> C1
+    F3 --> C2
+
+    C1 --> Scan["Scan — every rule is scoped to a single file"]
+    C2 --> Scan
+    Scan --> Sort["normalize — sort by path, then line, then ruleId"]
+    Sort --> Out["alpha/first.js<br/>mid/other.js<br/>zeta/last.js"]
+```
+
+Two properties do the work. A file never spans two chunks, and every rule reads
+only one file — so no rule can ever need data that landed in a different chunk.
+Ordering is then applied once, globally, after every chunk has been scanned,
+which is why the output order is independent of both the chunk boundaries and
+the order the files appeared in the payload.
 
 ## Provider design
 
@@ -57,6 +203,36 @@ category coerced into the allowed enums; `id` assigned by us; and `evidence`
 taken from our parse rather than from the model's output. A model that has been
 fully hijacked by text inside the diff still cannot emit a finding about a file
 it was never given, or place arbitrary text in the response.
+
+```mermaid
+flowchart TB
+    Diff["Parsed diff<br/>the files and added lines we actually sent"]
+    Prompt["Prompt<br/>nonce-fenced, marked untrusted data"]
+    Model(["Model"])
+    Raw["Raw JSON findings<br/>anything the model felt like saying"]
+
+    subgraph Anchor["Re-anchoring — the actual boundary"]
+        direction TB
+        Q1{"path is a file<br/>we sent?"}
+        Q2{"line is a real<br/>added line?"}
+        Q3["coerce severity and category to the allowed enums<br/>assign the id ourselves<br/>take evidence from our parse, not the model"]
+        Drop1["discard"]
+        Drop2["discard"]
+        Q1 -->|"no"| Drop1
+        Q1 -->|"yes"| Q2
+        Q2 -->|"no"| Drop2
+        Q2 -->|"yes"| Q3
+    end
+
+    Out["Finding"]
+
+    Diff --> Prompt --> Model --> Raw --> Q1
+    Diff -.->|"checked against"| Q1
+    Q3 --> Out
+```
+
+The prompt is the polite request; the anchor check is the enforcement. Only the
+second one holds when someone is actively trying to break it.
 
 ## Decisions worth defending
 
