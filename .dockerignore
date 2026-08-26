@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+scripts
+.env
+.probe-token
+*.md
+!README.md
+.vscode

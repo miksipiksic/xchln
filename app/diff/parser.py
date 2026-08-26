@@ -75,7 +75,10 @@ def _split_git_header(rest: str) -> tuple[str | None, str | None]:
 class _Block:
     """A single file's slice of the diff, accumulated verbatim."""
 
-    __slots__ = ("raw", "old_path", "new_path", "git_old", "git_new", "hunks", "binary")
+    __slots__ = (
+        "raw", "old_path", "new_path", "git_old", "git_new",
+        "hunks", "binary", "has_header",
+    )
 
     def __init__(self) -> None:
         self.raw: list[str] = []
@@ -85,6 +88,9 @@ class _Block:
         self.git_new: str | None = None
         self.hunks: list[Hunk] = []
         self.binary = False
+        # True once a file header has been seen. A bare hunk with no header is
+        # not a unified diff - there is no path to attribute findings to.
+        self.has_header = False
 
     def resolve_path(self) -> str:
         for candidate in (self.new_path, self.git_new, self.old_path, self.git_old):
@@ -174,6 +180,7 @@ def parse_diff(text: str) -> list[DiffFile]:
         if git_match:
             block = start_block()
             block.git_old, block.git_new = _split_git_header(git_match.group(1))
+            block.has_header = True
             block.raw.append(line)
             i += 1
             continue
@@ -185,6 +192,7 @@ def parse_diff(text: str) -> list[DiffFile]:
                 start_block()
             assert current is not None
             current.old_path = _clean_path(body[4:])
+            current.has_header = True
             current.raw.append(line)
             i += 1
             continue
@@ -194,6 +202,7 @@ def parse_diff(text: str) -> list[DiffFile]:
                 start_block()
             assert current is not None
             current.new_path = _clean_path(body[4:])
+            current.has_header = True
             current.raw.append(line)
             i += 1
             continue
@@ -235,7 +244,6 @@ def parse_diff(text: str) -> list[DiffFile]:
     if preamble:
         blocks[0].raw[:0] = preamble
 
-    files = [block.to_file() for block in blocks]
-    if not any(f.hunks or f.binary for f in files):
-        raise DiffParseError("no hunks found; not a unified diff")
-    return files
+    if not any(block.has_header and (block.hunks or block.binary) for block in blocks):
+        raise DiffParseError("no file header with hunks found; not a unified diff")
+    return [block.to_file() for block in blocks]
