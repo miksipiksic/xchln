@@ -286,6 +286,11 @@ fixtures in `tests/diffs.py`, so they cannot drift. The probe is what caught the
 things in-process tests structurally cannot: proxy buffering, platform body
 caps, cold-start latency.
 
+The same probe runs against three targets before a submission counts as
+verified: the app in-process, the container (`docker run`, non-root, healthcheck
+green, `$PORT` honoured), and the deployed URL. Each catches something the one
+before it cannot.
+
 That division earned itself. The unit suite was green throughout while two real
 defects sat in the `llm` path, and only driving a 128 KiB diff through the
 deployed service surfaced them: the endpoint answered `413` because a 64 KiB

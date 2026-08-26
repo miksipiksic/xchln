@@ -15,7 +15,10 @@ RUN pip install --no-cache-dir \
 
 COPY app ./app
 
-RUN useradd --system --uid 10001 appuser && chown -R appuser /srv
+# Explicit uid outside the system range: --system would warn, since 10001 is
+# above SYS_UID_MAX. Nothing here needs a login shell or a home directory.
+RUN useradd --no-create-home --shell /usr/sbin/nologin --uid 10001 appuser \
+    && chown -R appuser /srv
 USER appuser
 
 EXPOSE 8000
